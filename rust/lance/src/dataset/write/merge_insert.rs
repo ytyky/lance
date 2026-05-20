@@ -615,26 +615,40 @@ impl MergeInsertJob {
             .map(|_| SchemaComparison::Subschema)
     }
 
-    async fn join_key_as_scalar_index(&self) -> Result<Option<IndexMetadata>> {
-        if self.params.on.len() != 1 {
-            // joining on more than one column
-            Ok(None)
-        } else {
-            let col = &self.params.on[0];
-            self.dataset
+    /// Find a scalar index that can accelerate the join.
+    ///
+    /// For a single-column join this is straightforward: probe the index for
+    /// the join column. For a multi-column (composite key) join, any single
+    /// column from the key tuple is a correct super-set to probe: a target
+    /// row whose composite key matches `(a, b, ...)` necessarily matches on
+    /// each individual column too. The final hash join then filters down to
+    /// the exact composite-key matches, so probing one indexed column avoids
+    /// the full target scan without changing semantics.
+    ///
+    /// Returns the chosen column name together with its index metadata so
+    /// the caller knows which column to feed into `MapIndexExec`.
+    async fn join_key_as_scalar_index(&self) -> Result<Option<(String, IndexMetadata)>> {
+        for col in &self.params.on {
+            if let Some(idx) = self
+                .dataset
                 .load_scalar_index(
                     IndexCriteria::default()
                         .for_column(col)
                         // Unclear if this would work if the index does not support exact equality
                         .supports_exact_equality(),
                 )
-                .await
+                .await?
+            {
+                return Ok(Some((col.clone(), idx)));
+            }
         }
+        Ok(None)
     }
 
     async fn create_indexed_scan_joined_stream(
         &self,
         source: SendableRecordBatchStream,
+        index_column: String,
         index: IndexMetadata,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
@@ -653,17 +667,17 @@ impl MergeInsertJob {
         // the new data into memory.  In the future, we can do better
         let shared_input = Arc::new(ReplayExec::new(Capacity::Unbounded, input));
 
-        // 3 - Use the index to map input to row addresses
-        // First, we need to project to the key column
-        let field = schema.field_with_name(&self.params.on[0])?;
+        // 3 - Use the index to map input to row addresses.  For multi-column
+        //     joins we probe only the column whose index was selected; the
+        //     final hash join still matches on the full composite key.
+        let field = schema.field_with_name(&index_column)?;
         let index_mapper_input = Arc::new(project(
             shared_input.clone(),
-            // schema for only the key join column
+            // schema for only the indexed join column
             &Schema::new(vec![field.clone()]),
         )?);
 
-        // Then we pass the key column into the index mapper
-        let index_column = self.params.on[0].clone();
+        // Then we pass the indexed column into the index mapper
         let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
             // create index from original data and key column
             self.dataset.clone(),
@@ -739,22 +753,48 @@ impl MergeInsertJob {
         // field names (DF doesn't support this as of version 44)
         target = Self::prefix_columns_phys(target, "target_");
 
-        // 6 - Finally, join the input (source table) with the taken data (target table)
-        let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key = Column::new_with_schema(
-            &format!("target_{}", index_column),
-            target.schema().as_ref(),
-        )?;
+        // 6 - Finally, join the input (source table) with the taken data
+        //     (target table). For composite-key joins we must match on every
+        //     column in `on`, not just the indexed one. Probing a single
+        //     indexed column is a correct super-set (see
+        //     `join_key_as_scalar_index`), and this hash join trims the
+        //     candidates down to the exact composite-key matches.
+        let on_keys = self
+            .params
+            .on
+            .iter()
+            .map(|col| {
+                let source_key = Column::new_with_schema(col, shared_input.schema().as_ref())?;
+                let target_key =
+                    Column::new_with_schema(&format!("target_{}", col), target.schema().as_ref())?;
+                Ok::<_, Error>((
+                    Arc::new(source_key) as Arc<dyn PhysicalExpr>,
+                    Arc::new(target_key) as Arc<dyn PhysicalExpr>,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // For composite-key joins, match the standard SQL NULL semantics
+        // used by the full-scan path so callers get identical results
+        // regardless of which path runs.  The single-column path keeps its
+        // historical NullEqualsNull behavior to avoid changing existing
+        // semantics for that case.
+        let null_equality = if self.params.on.len() == 1 {
+            NullEquality::NullEqualsNull
+        } else {
+            NullEquality::NullEqualsNothing
+        };
+
         let joined = Arc::new(
             HashJoinExec::try_new(
                 shared_input,
                 target,
-                vec![(Arc::new(source_key), Arc::new(target_key))],
+                on_keys,
                 None,
                 &JoinType::Full,
                 None,
                 PartitionMode::CollectLeft,
-                NullEquality::NullEqualsNull,
+                null_equality,
                 false,
             )
             .unwrap(),
@@ -873,8 +913,10 @@ impl MergeInsertJob {
             )
         {
             // keeping unmatched rows, no deletion
-            if let Some(index) = self.join_key_as_scalar_index().await? {
-                return self.create_indexed_scan_joined_stream(source, index).await;
+            if let Some((index_column, index)) = self.join_key_as_scalar_index().await? {
+                return self
+                    .create_indexed_scan_joined_stream(source, index_column, index)
+                    .await;
             }
         }
 
@@ -3536,6 +3578,219 @@ mod tests {
             .unwrap();
 
         assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
+    }
+
+    /// Multi-column (composite key) merge_insert where a scalar index exists
+    /// on one of the join columns. Before this change the indexed path was
+    /// hard-gated to single-column joins and this case fell through to a
+    /// full target scan. The indexed path probes the indexed column to fetch
+    /// a candidate set and then post-filters on the full composite key, so
+    /// rows that share a value on the indexed column but differ on the
+    /// other key column must NOT be updated.
+    #[rstest::rstest]
+    #[case::index_on_first(true, false)]
+    #[case::index_on_second(false, true)]
+    #[case::index_on_both(true, true)]
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key(
+        #[case] index_on_a: bool,
+        #[case] index_on_b: bool,
+    ) {
+        // Target rows: (a, b, value)
+        //   (1, 10, 100), (1, 20, 200), (2, 10, 300), (2, 20, 400)
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("b", Int32, [10, 20, 10, 20]),
+            ("value", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        if index_on_a {
+            ds.create_index(&["a"], IndexType::Scalar, None, &params, false)
+                .await
+                .unwrap();
+        }
+        if index_on_b {
+            ds.create_index(&["b"], IndexType::Scalar, None, &params, false)
+                .await
+                .unwrap();
+        }
+
+        // Source rows: update (1, 10) to 999, insert (3, 30) as a new row.
+        // A naive single-column probe on `a` would fetch (1, 10) AND (1, 20)
+        // as candidates; the composite post-filter must drop (1, 20).
+        let source = record_batch!(
+            ("a", Int32, [1, 3]),
+            ("b", Int32, [10, 30]),
+            ("value", Int32, [999, 333])
+        )
+        .unwrap();
+
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (updated_ds, stats) = job
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1, "only (1, 10) should be updated");
+        assert_eq!(stats.num_inserted_rows, 1, "(3, 30) should be inserted");
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 5);
+
+        // (1, 20) must not have been clobbered by the (1, ...) probe.
+        let untouched = updated_ds
+            .count_rows(Some("a = 1 AND b = 20 AND value = 200".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(untouched, 1, "(1, 20) must keep its original value");
+
+        // (1, 10) should now carry the updated value.
+        let updated = updated_ds
+            .count_rows(Some("a = 1 AND b = 10 AND value = 999".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "(1, 10) should be updated to 999");
+
+        // (3, 30) should be present as a brand new row.
+        let inserted = updated_ds
+            .count_rows(Some("a = 3 AND b = 30 AND value = 333".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1, "(3, 30) should be inserted");
+    }
+
+    /// Composite key merge_insert where neither join column is indexed must
+    /// still work correctly (falling through to the existing full-scan path).
+    /// This guards against accidentally requiring an index for multi-column
+    /// joins after enabling the indexed path.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key_no_index() {
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2]),
+            ("b", Int32, [10, 20, 10]),
+            ("value", Int32, [100, 200, 300])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("a", Int32, [1]),
+            ("b", Int32, [20]),
+            ("value", Int32, [999])
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 0);
+        let count = updated_ds
+            .count_rows(Some("a = 1 AND b = 20 AND value = 999".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Composite-key merge_insert with a NULL value on a non-indexed key
+    /// column must use standard SQL equality (NULL != NULL) and insert the
+    /// row rather than match a target row that also has NULL on that column.
+    /// This locks in the parity between the indexed path and the full-scan
+    /// path so the optimization does not silently change NULL semantics.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key_null_semantics() {
+        let initial = record_batch!(
+            ("a", Int32, [Some(1)]),
+            ("b", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(10)])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.create_index(
+            &["a"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Source: same `a` value, NULL `b`. Standard SQL: NULL != NULL, so
+        // this must insert a second row rather than update the existing one.
+        let source = record_batch!(
+            ("a", Int32, [Some(1)]),
+            ("b", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(99)])
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            stats.num_inserted_rows, 1,
+            "NULL in `b` must not match an existing NULL `b`"
+        );
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
     }
 
     mod subcols {

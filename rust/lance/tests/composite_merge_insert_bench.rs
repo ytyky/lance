@@ -18,7 +18,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 
-const TARGET_ROWS: i64 = 200_000;
+const TARGET_ROWS: i64 = 2_000_000;
 const SOURCE_ROWS: i64 = 100;
 const ROWS_PER_FRAG: usize = 20_000;
 

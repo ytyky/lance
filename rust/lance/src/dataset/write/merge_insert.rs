@@ -3926,6 +3926,81 @@ mod tests {
         assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
     }
 
+    /// Composite-key `MapIndexExec` formats its Display so plans expose
+    /// every probed column, and `with_new_children` round-trips the full
+    /// lookup list rather than collapsing back to a single-column form.
+    /// Lives here (not in scalar_index.rs's tests) so the new lines don't
+    /// pile up in a file with pending upstream conflicts.
+    #[test]
+    fn map_index_exec_multi_lookup_plan_shape() {
+        use crate::io::exec::scalar_index::{IndexLookup, MapIndexExec, ScalarIndexExec};
+        use crate::utils::test::NoContextTestFixture;
+        use datafusion::physical_plan::{ExecutionPlan, displayable};
+        use datafusion::scalar::ScalarValue;
+        use lance_index::scalar::{
+            SargableQuery,
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
+        };
+        use lance_select::result::IndexExprResultWireFormat;
+
+        let fixture = NoContextTestFixture::new();
+        let dataset = Arc::new(fixture.dataset);
+
+        let dummy_input: Arc<dyn ExecutionPlan> = Arc::new(ScalarIndexExec::new(
+            dataset.clone(),
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "ordered".to_string(),
+                index_name: "ordered_idx".to_string(),
+                index_type: "BTree".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::UInt64(Some(1)))),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            }),
+            IndexExprResultWireFormat::default(),
+        ));
+
+        let lookups = vec![
+            IndexLookup::new("a", "a_idx"),
+            IndexLookup::new("b", "b_idx"),
+        ];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
+            dataset.clone(),
+            lookups,
+            dummy_input.clone(),
+        ));
+
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
+        assert!(
+            rendered.contains("IndexedLookup [a, b]"),
+            "multi-lookup Display must list every probed column, got: {rendered}",
+        );
+
+        let rebuilt = plan
+            .with_new_children(vec![dummy_input.clone()])
+            .expect("with_new_children must accept exactly one child");
+        let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
+        assert!(
+            rebuilt_rendered.contains("IndexedLookup [a, b]"),
+            "with_new_children must preserve every lookup, got: {rebuilt_rendered}",
+        );
+
+        // The single-lookup convenience constructor still renders without
+        // the column list, so existing EXPLAIN output is unchanged for
+        // single-column joins.
+        let single: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
+            dataset,
+            "ordered".to_string(),
+            "ordered_idx".to_string(),
+            dummy_input,
+        ));
+        let single_rendered = format!("{}", displayable(single.as_ref()).indent(false));
+        assert!(
+            single_rendered.contains("IndexedLookup")
+                && !single_rendered.contains("IndexedLookup ["),
+            "single-lookup Display must not include the column list, got: {single_rendered}",
+        );
+    }
+
     mod subcols {
         use super::*;
         use rstest::rstest;

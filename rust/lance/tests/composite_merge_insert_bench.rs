@@ -5,6 +5,10 @@
 //! Run with:
 //!   cargo test --release -p lance --test composite_merge_insert_bench \
 //!       -- --ignored --nocapture
+//!
+//! The whole point of this binary is to print timings to stdout, so the
+//! workspace-wide `print_stdout` lint is allowed here.
+#![allow(clippy::print_stdout)]
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,11 +38,7 @@ fn make_batch(start: i64, n: i64) -> RecordBatch {
     let a = Int64Array::from_iter_values(start..start + n);
     let b = Int64Array::from_iter_values((start..start + n).map(|i| i * 7 + 3));
     let value = Int64Array::from_iter_values(start..start + n);
-    RecordBatch::try_new(
-        schema(),
-        vec![Arc::new(a), Arc::new(b), Arc::new(value)],
-    )
-    .unwrap()
+    RecordBatch::try_new(schema(), vec![Arc::new(a), Arc::new(b), Arc::new(value)]).unwrap()
 }
 
 async fn build_dataset(path: &str) -> Dataset {
@@ -114,18 +114,15 @@ async fn bench_indexed_composite_merge_insert() {
         warmup_ds.restore().await.unwrap();
         let src = make_source();
         let reader = RecordBatchIterator::new(std::iter::once(Ok(src.clone())), src.schema());
-        MergeInsertBuilder::try_new(
-            Arc::new(warmup_ds),
-            vec!["a".to_string(), "b".to_string()],
-        )
-        .unwrap()
-        .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::InsertAll)
-        .try_build()
-        .unwrap()
-        .execute_reader(reader)
-        .await
-        .unwrap();
+        MergeInsertBuilder::try_new(Arc::new(warmup_ds), vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
     }
 
     const ITERS: u32 = 5;
@@ -138,18 +135,15 @@ async fn bench_indexed_composite_merge_insert() {
         let reader = RecordBatchIterator::new(std::iter::once(Ok(src.clone())), src.schema());
 
         let t0 = Instant::now();
-        MergeInsertBuilder::try_new(
-            Arc::new(bench_ds),
-            vec!["a".to_string(), "b".to_string()],
-        )
-        .unwrap()
-        .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::InsertAll)
-        .try_build()
-        .unwrap()
-        .execute_reader(reader)
-        .await
-        .unwrap();
+        MergeInsertBuilder::try_new(Arc::new(bench_ds), vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
         times.push(t0.elapsed());
     }
 

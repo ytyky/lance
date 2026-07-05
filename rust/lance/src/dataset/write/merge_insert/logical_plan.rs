@@ -187,15 +187,10 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
                 // Include unqualified columns like "__action" - tells us what operation to perform
                 None if field.name() == MERGE_ACTION_COLUMN => true,
 
-                // Partial-schema upsert: the `create_plan` builder adds
-                // unqualified columns (named after dataset fields) for every
-                // column missing from the source, filled from the target
-                // side of the join. Those columns carry the values that
-                // should be written for non-source columns, so they must
-                // flow through to the write exec alongside `source.*`.
-                None if self.dataset.schema().field(field.name()).is_some() => true,
-
-                // Skip other target columns (target.value, target.key, target._rowid) - not needed for write
+                // Skip other target columns (target.value, target.key, target._rowid) - not needed
+                // for write. In particular, dataset columns missing from a partial-schema source
+                // must NOT be pulled through the join: the write exec fetches them by row address
+                // instead, so that the join's collected build side stays narrow.
                 _ => false,
             };
 

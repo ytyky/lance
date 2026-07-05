@@ -1646,15 +1646,6 @@ impl MergeInsertJob {
             .collect::<Vec<_>>();
         let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
-        // Capture the source field names *before* aliasing / joining so we
-        // can tell which dataset columns are missing from the source and
-        // need to be filled from the target side of the join below.
-        let source_field_names: std::collections::HashSet<String> = source_df
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
         // Inject a sentinel literal column so we can reliably determine, after the join,
         // whether the source side contributed a row.  This is NULL-safe: even when every
         // ON column is NULL the sentinel lets us distinguish a source-only row from a
@@ -1666,7 +1657,15 @@ impl MergeInsertJob {
         let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
-        let mut df = scan_aliased
+        // Partial-schema upsert note: dataset columns missing from the source
+        // are deliberately NOT copied out of the target side of this join.
+        // The join's target side is collected into memory (CollectLeft build
+        // side), so copying payload columns through it materializes every
+        // target row's payload at once and OOMs on wide tables. Instead the
+        // write exec fetches those columns per output batch, by row address
+        // (see `TargetColumnFiller`), which keeps memory bounded and only
+        // reads the rows that are actually written.
+        let df = scan_aliased
             .join(
                 source_df_aliased,
                 join_type,
@@ -1678,26 +1677,6 @@ impl MergeInsertJob {
                 MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
             )?;
-
-        // Partial-schema upsert: for every dataset column missing from the
-        // source, add a synthetic unqualified column that copies the target
-        // side's value for that column. For matched rows this carries the
-        // existing target value (preserving non-source columns on update);
-        // for unmatched source rows (inserts) the outer join leaves the
-        // target side NULL, so inserts get NULL for missing columns. The
-        // unqualified name matches the dataset field and becomes a normal
-        // data column from the write exec's perspective.
-        //
-        // We iterate the dataset schema in order so that the resulting
-        // physical plan is deterministic and easy to inspect in tests.
-        for field in dataset_schema.fields() {
-            if !source_field_names.contains(field.name()) {
-                df = df.with_column(
-                    field.name(),
-                    logical_expr::col(format!("target.\"{}\"", field.name())),
-                )?;
-            }
-        }
 
         let (session_state, logical_plan) = df.into_parts();
 
@@ -1829,8 +1808,8 @@ impl MergeInsertJob {
         );
 
         // Partial-schema upsert: every source field must exist in the target
-        // and have a compatible data type. Missing target columns will be
-        // filled from the target side of the join in `create_plan`.
+        // and have a compatible data type. Missing target columns are
+        // fetched from the target by row address in the write exec.
         let is_subset_schema = !is_full_schema
             && lance_schema.fields.iter().all(|sf| {
                 full_schema
@@ -5231,7 +5210,7 @@ mod tests {
             new_data: RecordBatch,
         }
 
-        async fn setup(scalar_index: bool) -> Fixtures {
+        async fn setup(scalar_index: bool, stable_row_ids: bool) -> Fixtures {
             let data = lance_datagen::gen_batch()
                 .with_seed(Seed::from(1))
                 .col("other", array::rand_utf8(4.into(), false))
@@ -5250,6 +5229,7 @@ mod tests {
             let write_params = WriteParams {
                 max_rows_per_file: 256,
                 max_rows_per_group: 32, // Non-standard group size to hit edge cases
+                enable_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let mut ds = Dataset::write(reader, "memory://", Some(write_params.clone()))
@@ -5299,7 +5279,7 @@ mod tests {
             // it uniformly through the action column, so the previously-
             // rejected configuration now succeeds. This test asserts the
             // successful path to keep the negative-test history explicit.
-            let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(false, false)).await;
 
             let rows_before = ds.count_rows(None).await.unwrap() as u64;
 
@@ -5338,7 +5318,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_errors_on_bad_schema() {
-            let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(false, false)).await;
 
             // Schema with different names, which should be rejected.
             let bad_schema = Arc::new(Schema::new(vec![
@@ -5375,7 +5355,7 @@ mod tests {
             #[values(false, true)] scalar_index: bool,
             #[values(false, true)] insert: bool,
         ) {
-            let Fixtures { ds, new_data } = Box::pin(setup(scalar_index)).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(scalar_index, false)).await;
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
                 new_data.schema(),
@@ -5385,6 +5365,31 @@ mod tests {
                 .iter()
                 .map(|f| f.metadata().clone())
                 .collect::<Vec<_>>();
+
+            // Capture `other` per key before the merge so we can verify the
+            // exact value is preserved for updated rows (the write path must
+            // fetch the matched target row's value, not just any value).
+            let other_before: std::collections::HashMap<String, String> = {
+                let data = ds.scan().try_into_batch().await.unwrap();
+                let keys = data
+                    .column_by_name("key")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap()
+                    .clone();
+                let others = data
+                    .column_by_name("other")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap()
+                    .clone();
+                (0..data.num_rows())
+                    .map(|i| (keys.value(i).to_string(), others.value(i).to_string()))
+                    .collect()
+            };
+
             let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
                 .unwrap()
                 .when_matched(WhenMatched::UpdateAll)
@@ -5517,12 +5522,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
-            let mut row_by_key: HashMap<String, (u32, String)> = HashMap::new();
+            let mut row_by_key: HashMap<String, (u32, Option<String>)> = HashMap::new();
             for i in 0..data.num_rows() {
-                row_by_key.insert(
-                    key_col.value(i).to_string(),
-                    (value_col.value(i), other_col.value(i).to_string()),
-                );
+                let other = (!other_col.is_null(i)).then(|| other_col.value(i).to_string());
+                row_by_key.insert(key_col.value(i).to_string(), (value_col.value(i), other));
             }
 
             // Pull original column data for reference lookups.
@@ -5540,15 +5543,17 @@ mod tests {
                 .downcast_ref::<UInt32Array>()
                 .unwrap();
             // Every updated source row (270 of them) should be present
-            // with its new value and a preserved `other` string.
+            // with its new value and the exact `other` string it had
+            // before the merge.
             for i in 0..(new_data.num_rows() - 2) {
                 let key = new_keys.value(i).to_string();
                 let (value, other) = row_by_key
                     .get(&key)
                     .unwrap_or_else(|| panic!("updated key {} missing from result", key));
                 assert_eq!(*value, new_values.value(i));
-                assert!(
-                    !other.is_empty(),
+                assert_eq!(
+                    other.as_deref(),
+                    other_before.get(&key).map(|s| s.as_str()),
                     "updated row for key {} should retain its original `other` value",
                     key
                 );
@@ -5558,15 +5563,156 @@ mod tests {
                 let key = new_keys.value(i).to_string();
                 let found = row_by_key.get(&key);
                 if insert {
-                    let (value, _) =
+                    let (value, other) =
                         found.unwrap_or_else(|| panic!("inserted key {} missing from result", key));
                     assert_eq!(*value, new_values.value(i));
+                    assert!(
+                        other.is_none(),
+                        "inserted row for key {} has no matched target row, so `other` must be NULL",
+                        key
+                    );
                 } else {
                     assert!(
                         found.is_none(),
                         "unmatched source row for key {} must not be present when insert=false",
                         key
                     );
+                }
+            }
+        }
+
+        /// Partial-schema batches that contain no matched row at all:
+        /// an insert-only source must fill the missing column with NULL
+        /// without issuing a target take (every `_rowaddr` is NULL), and a
+        /// fully-unmatched source with inserts disabled must write nothing.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_insert_only_and_unmatched() {
+            let Fixtures { ds, new_data } = Box::pin(setup(false, false)).await;
+            let rows_before = ds.count_rows(None).await.unwrap();
+
+            // The last two rows of new_data are keys that do not exist in
+            // the target dataset.
+            let unmatched = new_data.slice(new_data.num_rows() - 2, 2);
+
+            // Inserts disabled: every source row resolves to a no-op, so the
+            // write stream produces only empty batches and commits nothing.
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(unmatched.clone())],
+                unmatched.schema(),
+            ));
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+            let (ds, stats) = job.execute_reader(reader).await.unwrap();
+            assert_eq!(stats.num_updated_rows, 0);
+            assert_eq!(stats.num_inserted_rows, 0);
+            assert_eq!(stats.num_deleted_rows, 0);
+            assert_eq!(ds.count_rows(None).await.unwrap(), rows_before);
+
+            // Insert-only merge: the batch reaching the write exec has no
+            // matched row, so the missing `other` column is NULL-filled
+            // without reading the target.
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(unmatched.clone())],
+                unmatched.schema(),
+            ));
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+            let (ds, stats) = job.execute_reader(reader).await.unwrap();
+            assert_eq!(stats.num_updated_rows, 0);
+            assert_eq!(stats.num_inserted_rows, 2);
+            assert_eq!(ds.count_rows(None).await.unwrap(), rows_before + 2);
+
+            let inserted_keys = unmatched
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let filter = format!(
+                "key IN ('{}', '{}')",
+                inserted_keys.value(0),
+                inserted_keys.value(1)
+            );
+            let data = ds
+                .scan()
+                .filter(&filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(data.num_rows(), 2);
+            let other_col = data.column_by_name("other").unwrap();
+            assert_eq!(
+                other_col.null_count(),
+                2,
+                "inserted rows must have NULL for the column missing from the source"
+            );
+        }
+
+        /// Same partial-schema upsert as `test_merge_insert_subcols`, but on
+        /// a dataset with stable row ids. Stable row ids route the write
+        /// through the ordered update/insert split stream, so this covers
+        /// the target-column fill on that path as well.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_stable_row_ids() {
+            let Fixtures { ds, new_data } = Box::pin(setup(false, true)).await;
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            ));
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+            let (ds, stats) = job.execute_reader(reader).await.unwrap();
+
+            assert_eq!(stats.num_updated_rows, (new_data.num_rows() - 2) as u64);
+            assert_eq!(stats.num_inserted_rows, 2);
+            assert_eq!(stats.num_deleted_rows, 0);
+
+            let data = ds.scan().try_into_batch().await.unwrap();
+            assert_eq!(data.num_rows(), 1024 + 2);
+
+            // Updated rows keep a non-null `other` (fetched from the matched
+            // target row); the 2 inserted rows get NULL.
+            let key_col = data
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let other_col = data.column_by_name("other").unwrap();
+            let new_keys = new_data
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let updated: std::collections::HashSet<&str> = (0..new_data.num_rows() - 2)
+                .map(|i| new_keys.value(i))
+                .collect();
+            let inserted: std::collections::HashSet<&str> = (new_data.num_rows() - 2
+                ..new_data.num_rows())
+                .map(|i| new_keys.value(i))
+                .collect();
+            for i in 0..data.num_rows() {
+                let key = key_col.value(i);
+                if inserted.contains(key) {
+                    assert!(
+                        other_col.is_null(i),
+                        "inserted key {} must have NULL other",
+                        key
+                    );
+                } else if updated.contains(key) {
+                    assert!(!other_col.is_null(i), "updated key {} must keep other", key);
                 }
             }
         }
@@ -5578,7 +5724,7 @@ mod tests {
         /// full-schema upserts instead of falling back to v1.
         #[tokio::test]
         async fn test_merge_insert_subcols_v2_explain_plan() {
-            let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(false, false)).await;
 
             let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
                 .unwrap()
@@ -5608,18 +5754,15 @@ mod tests {
                 "expected HashJoinExec in plan, got: {}",
                 plan
             );
-            // Evidence that the partial-schema fix is active: the target
-            // side of the join reads the `other` column (which is missing
-            // from the source) and an explicit projection carries it
-            // through to the write exec alongside source columns.
+            // The `other` column (missing from the source) must NOT be
+            // routed through the join: the target scan feeds the collected
+            // build side of the hash join, so pulling payload columns
+            // through it materializes the whole target in memory. The write
+            // exec fetches `other` per batch by row address instead, so the
+            // target-side scan stays narrow (join key + row id + row addr).
             assert!(
-                plan.contains("LanceRead") && plan.contains("projection=[other"),
-                "target-side scan should include the filled `other` column: {}",
-                plan
-            );
-            assert!(
-                plan.contains("other@0 as other"),
-                "expected post-join projection to carry `other` from the target side: {}",
+                plan.contains("LanceRead") && !plan.contains("other"),
+                "target-side scan must not read the `other` payload column: {}",
                 plan
             );
         }

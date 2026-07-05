@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array, UInt32Array, UInt64Array};
 use arrow_schema::Schema;
 use arrow_select;
 use datafusion::common::{DataFusionError, Result as DFResult};
@@ -20,6 +20,7 @@ use datafusion::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ID};
+use lance_datafusion::projection::ProjectionPlan;
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
 
@@ -32,6 +33,7 @@ use crate::dataset::write::merge_insert::{
     MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
     format_key_values_on_columns, resolve_target_bases,
 };
+use crate::dataset::{ProjectionRequest, TakeBuilder};
 use crate::{
     Dataset,
     dataset::{
@@ -193,6 +195,146 @@ impl MergeState {
     }
 }
 
+/// Where each output column of the write stream comes from, in dataset
+/// schema order.
+#[derive(Debug, Clone, Copy)]
+enum WriteColumnSource {
+    /// The column is present in the exec's input (provided by the source).
+    Input(usize),
+    /// The column is missing from the source (partial-schema upsert) and is
+    /// fetched from the target by row address; index into
+    /// [`TargetColumnFiller::fields`].
+    FillFromTarget(usize),
+}
+
+/// Fetches target-side values for dataset columns that a partial-schema
+/// source does not provide.
+///
+/// The values are fetched one batch at a time, by the `_rowaddr` of the
+/// matched target rows, so peak memory is bounded by the batch size. This
+/// deliberately replaces the earlier approach of copying these columns
+/// through the join in the logical plan: there the target scan fed the
+/// build side of a `CollectLeft` hash join, so every payload column of
+/// every target row was collected into memory at once, which caused OOM on
+/// wide tables.
+#[derive(Debug)]
+struct TargetColumnFiller {
+    dataset: Arc<Dataset>,
+    projection: Arc<ProjectionPlan>,
+    /// The filled fields, matching the projection. Nullable because
+    /// inserted rows (no matched target row) receive NULL.
+    fields: Vec<arrow_schema::FieldRef>,
+}
+
+impl TargetColumnFiller {
+    fn try_new(dataset: Arc<Dataset>, fields: Vec<arrow_schema::FieldRef>) -> DFResult<Self> {
+        let names = fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>();
+        let projection = ProjectionRequest::from_columns(names, dataset.schema())
+            .into_projection_plan(dataset.clone())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Self {
+            dataset,
+            projection: Arc::new(projection),
+            fields,
+        })
+    }
+
+    /// Returns one array per filled field, aligned with `row_addrs`: rows
+    /// with a valid row address (updates) get the target's current value,
+    /// rows with a NULL row address (inserts) get NULL.
+    async fn fetch(&self, row_addrs: &UInt64Array) -> DFResult<Vec<ArrayRef>> {
+        let valid_addrs: Vec<u64> = (0..row_addrs.len())
+            .filter(|&i| row_addrs.is_valid(i))
+            .map(|i| row_addrs.value(i))
+            .collect();
+
+        if valid_addrs.is_empty() {
+            return Ok(self
+                .fields
+                .iter()
+                .map(|field| arrow_array::new_null_array(field.data_type(), row_addrs.len()))
+                .collect());
+        }
+
+        let mut sorted_addrs = valid_addrs;
+        sorted_addrs.sort_unstable();
+        sorted_addrs.dedup();
+
+        let taken = TakeBuilder::try_new_from_addresses(
+            self.dataset.clone(),
+            sorted_addrs,
+            self.projection.clone(),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .with_row_address(true)
+        .execute()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Map each returned row address back to its position in the taken
+        // batch so we do not depend on the take preserving request order.
+        let taken_addrs = taken
+            .column_by_name(ROW_ADDR)
+            .ok_or_else(|| {
+                DataFusionError::Internal("take result is missing the _rowaddr column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected UInt64Array for _rowaddr column".to_string())
+            })?;
+        let addr_to_taken_idx: HashMap<u64, u32> = taken_addrs
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(idx, addr)| (*addr, idx as u32))
+            .collect();
+
+        let indices =
+            (0..row_addrs.len())
+                .map(|i| {
+                    if row_addrs.is_valid(i) {
+                        let addr = row_addrs.value(i);
+                        addr_to_taken_idx.get(&addr).copied().map(Some).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Row address {} matched by the merge join was not returned by take",
+                            addr
+                        ))
+                    })
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .collect::<DFResult<UInt32Array>>()?;
+
+        self.fields
+            .iter()
+            .map(|field| {
+                let column = taken.column_by_name(field.name()).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "take result is missing the {:?} column",
+                        field.name()
+                    ))
+                })?;
+                arrow_select::take::take(column, &indices, None).map_err(DataFusionError::from)
+            })
+            .collect()
+    }
+}
+
+/// Precomputed layout of the write stream: where the control columns live
+/// in the input, how to assemble output columns in dataset schema order,
+/// and (for partial-schema sources) how to fill the missing columns.
+#[derive(Debug)]
+struct WriteStreamContext {
+    rowaddr_idx: usize,
+    rowid_idx: usize,
+    action_idx: usize,
+    column_sources: Vec<WriteColumnSource>,
+    filler: Option<TargetColumnFiller>,
+    output_schema: Arc<Schema>,
+}
+
 /// Inserts new rows and updates existing rows in the target table.
 ///
 /// This does the actual write.
@@ -328,48 +470,58 @@ impl FullSchemaMergeInsertExec {
         input_stream: SendableRecordBatchStream,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let (_, rowaddr_idx, rowid_idx, action_idx, data_column_indices, output_schema) =
-            self.prepare_stream_schema(input_stream.schema())?;
+        let ctx = self.prepare_stream_schema(input_stream.schema())?;
 
-        let output_schema_clone = output_schema.clone();
-        let stream = input_stream.map(move |batch_result| -> DFResult<RecordBatch> {
-            let batch = batch_result?;
-            let (row_addr_array, row_id_array, action_array) =
-                Self::extract_control_arrays(&batch, rowaddr_idx, rowid_idx, action_idx)?;
+        let output_schema = ctx.output_schema.clone();
+        let stream = input_stream.then(move |batch_result| {
+            let ctx = ctx.clone();
+            let merge_state = merge_state.clone();
+            async move {
+                let batch = batch_result?;
+                let (row_addr_array, row_id_array, action_array) = Self::extract_control_arrays(
+                    &batch,
+                    ctx.rowaddr_idx,
+                    ctx.rowid_idx,
+                    ctx.action_idx,
+                )?;
 
-            // Process each row using the shared state
-            let mut keep_rows: Vec<u32> = Vec::with_capacity(batch.num_rows());
+                // Process each row using the shared state
+                let mut keep_rows: Vec<u32> = Vec::with_capacity(batch.num_rows());
 
-            let mut merge_state = merge_state.lock().map_err(|e| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "Failed to lock merge state: {}",
-                    e
-                ))
-            })?;
-
-            for row_idx in 0..batch.num_rows() {
-                let action_code = action_array.value(row_idx);
-                let action = Action::try_from(action_code).map_err(|e| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "Invalid action code {}: {}",
-                        action_code, e
-                    ))
-                })?;
-
-                if merge_state
-                    .process_row_action(action, row_idx, row_addr_array, row_id_array, &batch)?
-                    .is_some()
                 {
-                    keep_rows.push(row_idx as u32);
-                }
-            }
+                    let mut merge_state = merge_state.lock().map_err(|e| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "Failed to lock merge state: {}",
+                            e
+                        ))
+                    })?;
 
-            Self::create_filtered_batch(
-                &batch,
-                keep_rows,
-                &data_column_indices,
-                output_schema_clone.clone(),
-            )
+                    for row_idx in 0..batch.num_rows() {
+                        let action_code = action_array.value(row_idx);
+                        let action = Action::try_from(action_code).map_err(|e| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "Invalid action code {}: {}",
+                                action_code, e
+                            ))
+                        })?;
+
+                        if merge_state
+                            .process_row_action(
+                                action,
+                                row_idx,
+                                row_addr_array,
+                                row_id_array,
+                                &batch,
+                            )?
+                            .is_some()
+                        {
+                            keep_rows.push(row_idx as u32);
+                        }
+                    }
+                }
+
+                Self::create_write_batch(&batch, keep_rows, &ctx).await
+            }
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -403,18 +555,10 @@ impl FullSchemaMergeInsertExec {
     }
 
     /// Common schema preparation logic
-    #[allow(clippy::type_complexity)]
     fn prepare_stream_schema(
         &self,
         input_schema: arrow_schema::SchemaRef,
-    ) -> DFResult<(
-        arrow_schema::SchemaRef,
-        usize,
-        usize,
-        usize,
-        Vec<usize>,
-        Arc<Schema>,
-    )> {
+    ) -> DFResult<Arc<WriteStreamContext>> {
         // Find column indices
         let (rowaddr_idx, _) = input_schema.column_with_name(ROW_ADDR).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(
@@ -437,17 +581,15 @@ impl FullSchemaMergeInsertExec {
                 ))
             })?;
 
-        // Emit data columns in dataset-schema order, keyed by name. This
-        // matters for partial-schema upserts, where `create_plan` adds
-        // synthetic unqualified columns (filled from the target side) at
-        // the end of the logical projection. Without name-based reordering
-        // they would land at the end of the write stream and mismatch the
-        // intended writer schema (which is `dataset.schema()`). Using name
-        // lookup is also a strictly-safer choice for the full-schema path:
-        // it turns an implicit positional assumption into an explicit
-        // name-based invariant.
-        let mut name_to_idx: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::with_capacity(input_schema.fields().len());
+        // Emit data columns in dataset-schema order, keyed by name. Columns
+        // present in the input come from the source; dataset columns that a
+        // partial-schema source omits are fetched from the target per batch
+        // (see [`TargetColumnFiller`]) rather than routed through the join.
+        // Name-based lookup is also a strictly-safer choice for the
+        // full-schema path: it turns an implicit positional assumption into
+        // an explicit name-based invariant.
+        let mut name_to_idx: HashMap<&str, usize> =
+            HashMap::with_capacity(input_schema.fields().len());
         for (idx, field) in input_schema.fields().iter().enumerate() {
             let name = field.name();
             // Skip special columns: _rowaddr, _rowid, __action, and the
@@ -467,39 +609,55 @@ impl FullSchemaMergeInsertExec {
 
         let dataset_arrow_schema: arrow_schema::Schema = self.dataset.schema().into();
         let dataset_fields = dataset_arrow_schema.fields();
-        let mut data_column_indices: Vec<usize> = Vec::with_capacity(dataset_fields.len());
+        let mut column_sources: Vec<WriteColumnSource> = Vec::with_capacity(dataset_fields.len());
+        let mut fill_fields: Vec<arrow_schema::FieldRef> = Vec::new();
         let mut output_fields: Vec<Arc<arrow_schema::Field>> =
             Vec::with_capacity(dataset_fields.len());
+        let mut num_input_columns = 0;
         for dataset_field in dataset_fields {
-            let idx = *name_to_idx
-                .get(dataset_field.name().as_str())
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "Dataset field {:?} missing from merge insert input schema \
-                     — this indicates a logical plan pruning bug",
-                        dataset_field.name()
-                    ))
-                })?;
-            data_column_indices.push(idx);
-            output_fields.push(Arc::new(input_schema.field(idx).clone()));
+            match name_to_idx.get(dataset_field.name().as_str()) {
+                Some(&idx) => {
+                    column_sources.push(WriteColumnSource::Input(idx));
+                    output_fields.push(Arc::new(input_schema.field(idx).clone()));
+                    num_input_columns += 1;
+                }
+                None => {
+                    // Nullable regardless of the dataset field: inserted rows
+                    // have no matched target row and receive NULL (the writer
+                    // schema is what the commit validates against).
+                    let field = Arc::new(dataset_field.as_ref().clone().with_nullable(true));
+                    column_sources.push(WriteColumnSource::FillFromTarget(fill_fields.len()));
+                    fill_fields.push(field.clone());
+                    output_fields.push(field);
+                }
+            }
         }
 
-        if data_column_indices.is_empty() {
+        if num_input_columns == 0 {
             return Err(datafusion::error::DataFusionError::Internal(
                 "No data columns found in merge insert input".to_string(),
             ));
         }
 
+        let filler = if fill_fields.is_empty() {
+            None
+        } else {
+            Some(TargetColumnFiller::try_new(
+                self.dataset.clone(),
+                fill_fields,
+            )?)
+        };
+
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        Ok((
-            input_schema,
+        Ok(Arc::new(WriteStreamContext {
             rowaddr_idx,
             rowid_idx,
             action_idx,
-            data_column_indices,
+            column_sources,
+            filler,
             output_schema,
-        ))
+        }))
     }
 
     /// Extract control arrays from batch
@@ -544,21 +702,24 @@ impl FullSchemaMergeInsertExec {
         Ok((row_addr_array, row_id_array, action_array))
     }
 
-    /// Create filtered batch from selected rows
-    fn create_filtered_batch(
+    /// Create the batch to write from the selected rows, assembling columns
+    /// in dataset schema order. Columns a partial-schema source does not
+    /// provide are fetched from the target for this batch only, keeping
+    /// memory bounded by the batch size.
+    async fn create_write_batch(
         batch: &RecordBatch,
         keep_rows: Vec<u32>,
-        data_column_indices: &[usize],
-        output_schema: Arc<Schema>,
+        ctx: &WriteStreamContext,
     ) -> DFResult<RecordBatch> {
         // If no rows to keep, return empty batch
         if keep_rows.is_empty() {
-            let empty_columns: Vec<_> = output_schema
+            let empty_columns: Vec<_> = ctx
+                .output_schema
                 .fields()
                 .iter()
                 .map(|field| arrow_array::new_empty_array(field.data_type()))
                 .collect();
-            return RecordBatch::try_new(output_schema, empty_columns)
+            return RecordBatch::try_new(ctx.output_schema.clone(), empty_columns)
                 .map_err(datafusion::error::DataFusionError::from);
         }
 
@@ -568,13 +729,31 @@ impl FullSchemaMergeInsertExec {
         // Take only the rows we want to keep
         let filtered_batch = arrow_select::take::take_record_batch(batch, &indices)?;
 
-        // Project only the data columns
-        let output_columns: Vec<_> = data_column_indices
+        let fill_arrays = if let Some(filler) = &ctx.filler {
+            let row_addrs = filtered_batch
+                .column(ctx.rowaddr_idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(
+                        "Expected UInt64Array for _rowaddr column".to_string(),
+                    )
+                })?;
+            filler.fetch(row_addrs).await?
+        } else {
+            Vec::new()
+        };
+
+        let output_columns: Vec<_> = ctx
+            .column_sources
             .iter()
-            .map(|&idx| filtered_batch.column(idx).clone())
+            .map(|source| match source {
+                WriteColumnSource::Input(idx) => filtered_batch.column(*idx).clone(),
+                WriteColumnSource::FillFromTarget(idx) => fill_arrays[*idx].clone(),
+            })
             .collect();
 
-        RecordBatch::try_new(output_schema, output_columns)
+        RecordBatch::try_new(ctx.output_schema.clone(), output_columns)
             .map_err(datafusion::error::DataFusionError::from)
     }
 
@@ -600,13 +779,12 @@ impl FullSchemaMergeInsertExec {
         input_stream: SendableRecordBatchStream,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<(SendableRecordBatchStream, SendableRecordBatchStream)> {
-        let (_, rowaddr_idx, rowid_idx, action_idx, data_column_indices, output_schema) =
-            self.prepare_stream_schema(input_stream.schema())?;
+        let ctx = self.prepare_stream_schema(input_stream.schema())?;
+        let output_schema = ctx.output_schema.clone();
 
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let (insert_tx, insert_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let output_schema_clone = output_schema.clone();
         let merge_state_clone = merge_state;
 
         tokio::spawn(async move {
@@ -615,15 +793,9 @@ impl FullSchemaMergeInsertExec {
             while let Some(batch_result) = input_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
-                        match Self::process_and_split_batch(
-                            &batch,
-                            rowaddr_idx,
-                            rowid_idx,
-                            action_idx,
-                            &data_column_indices,
-                            output_schema_clone.clone(),
-                            merge_state_clone.clone(),
-                        ) {
+                        match Self::process_and_split_batch(&batch, &ctx, merge_state_clone.clone())
+                            .await
+                        {
                             Ok((update_batch_opt, insert_batch_opt)) => {
                                 if let Some(update_batch) = update_batch_opt
                                     && update_tx.send(Ok(update_batch)).is_err()
@@ -663,17 +835,13 @@ impl FullSchemaMergeInsertExec {
         Ok((update_stream, insert_stream))
     }
 
-    fn process_and_split_batch(
+    async fn process_and_split_batch(
         batch: &RecordBatch,
-        rowaddr_idx: usize,
-        rowid_idx: usize,
-        action_idx: usize,
-        data_column_indices: &[usize],
-        output_schema: Arc<Schema>,
+        ctx: &WriteStreamContext,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<(Option<RecordBatch>, Option<RecordBatch>)> {
         let (row_addr_array, row_id_array, action_array) =
-            Self::extract_control_arrays(batch, rowaddr_idx, rowid_idx, action_idx)?;
+            Self::extract_control_arrays(batch, ctx.rowaddr_idx, ctx.rowid_idx, ctx.action_idx)?;
 
         let mut update_indices: Vec<u32> = Vec::new();
         let mut insert_indices: Vec<u32> = Vec::new();
@@ -709,23 +877,13 @@ impl FullSchemaMergeInsertExec {
         }
 
         let update_batch = if !update_indices.is_empty() {
-            Some(Self::create_filtered_batch(
-                batch,
-                update_indices,
-                data_column_indices,
-                output_schema.clone(),
-            )?)
+            Some(Self::create_write_batch(batch, update_indices, ctx).await?)
         } else {
             None
         };
 
         let insert_batch = if !insert_indices.is_empty() {
-            Some(Self::create_filtered_batch(
-                batch,
-                insert_indices,
-                data_column_indices,
-                output_schema,
-            )?)
+            Some(Self::create_write_batch(batch, insert_indices, ctx).await?)
         } else {
             None
         };
